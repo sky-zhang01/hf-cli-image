@@ -1,0 +1,184 @@
+name: Track upstream and publish
+
+# No dependency bot is involved: tracking upstream is this repository's own function, so
+# there is no pinned version for Renovate or Dependabot to bump.
+#
+# Everything happens in ONE job on purpose. A push made with GITHUB_TOKEN does not trigger
+# further workflow runs, so a "detect -> commit -> build" split across jobs would silently
+# never build, and working around that would cost a PAT this repository does not need.
+on:
+  schedule:
+    # Every 6h rather than daily: GitHub may drop scheduled runs under load, and four
+    # attempts a day bound a dropped run at ~6h. Upstream ships roughly weekly.
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild and overwrite even if this version is already published'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # push the git tag (this is also the repository activity that keeps a
+                    # scheduled workflow from being auto-disabled after 60 quiet days)
+  packages: write   # push to GHCR
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/hf-cli
+  # The exact Accept list sent by the intended consumer's image-update check. Its digest
+  # parser only handles these two Docker schema2 types; an OCI image manifest or an OCI
+  # index falls through to an empty result with no error and no log, which would make new
+  # versions permanently undetectable. The gate below replays this byte-for-byte.
+  CONSUMER_ACCEPT: 'application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v1+json, application/vnd.oci.image.index.v1+json'
+
+jobs:
+  track-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve the upstream release
+        id: up
+        run: |
+          set -euo pipefail
+          # Hard-fail on an unreachable or reshaped PyPI response. Falling back to
+          # "assume unchanged" would be indistinguishable from "there is no new release".
+          version="$(curl -fsS --retry 3 --connect-timeout 10 \
+            https://pypi.org/pypi/huggingface_hub/json | jq -er '.info.version')"
+          case "$version" in ''|null) echo "::error::could not resolve upstream version"; exit 1 ;; esac
+          # This value comes from a third party and then reaches `docker tag` and `git tag`.
+          # Constrain it to a PEP 440-ish release string so no metacharacter can ride along,
+          # and so a reshaped API response fails loudly instead of producing a junk tag.
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+(\.[0-9]+)*((a|b|rc|\.post|\.dev)[0-9]+)?$'; then
+            echo "::error::refusing unexpected version string from PyPI: ${version}"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "::notice::upstream huggingface_hub == $version"
+
+      - name: Log in to GHCR
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+      - name: Decide whether to build
+        id: decide
+        env:
+          V: ${{ steps.up.outputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          # The registry is the state store: no state file of our own can disagree with it.
+          # This is also what makes the version tag immutable in normal operation — an
+          # already-published version is never rebuilt unless `force` is used.
+          if [ "$FORCE" = "true" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::force=true — an existing ${V} tag will be overwritten"
+          elif docker manifest inspect "${IMAGE}:${V}" >/dev/null 2>&1; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::${IMAGE}:${V} already published — nothing to do"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # --load, never --push. A bare `docker buildx build --push` emits OCI media types,
+      # which the consumer cannot parse. Building into the local image store and pushing
+      # from there yields application/vnd.docker.distribution.manifest.v2+json.
+      - name: Build locally
+        if: steps.decide.outputs.build == 'true'
+        env:
+          V: ${{ steps.up.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker buildx build --load \
+            --build-arg "HF_VERSION=${V}" \
+            --tag "${IMAGE}:${V}" .
+
+      - name: Prove the image before anything is publishable
+        if: steps.decide.outputs.build == 'true'
+        env:
+          V: ${{ steps.up.outputs.version }}
+        run: |
+          set -euo pipefail
+          got="$(docker run --rm "${IMAGE}:${V}" hf version)"
+          echo "hf version -> ${got}"
+          printf '%s' "$got" | grep -q "${V}"
+          label="$(docker inspect "${IMAGE}:${V}" \
+            --format '{{index .Config.Labels "org.opencontainers.image.version"}}')"
+          [ "$label" = "${V}" ] || { echo "::error::label '${label}' != '${V}'"; exit 1; }
+
+      - name: Push the immutable version tag
+        if: steps.decide.outputs.build == 'true'
+        env:
+          V: ${{ steps.up.outputs.version }}
+        run: docker push "${IMAGE}:${V}"
+
+      # The load-bearing gate. Replays the consumer's own anonymous request, with its exact
+      # Accept list, against the tag just published. Without this the whole pipeline can run
+      # green while the consumer stays permanently blind to new versions.
+      - name: Gate — replay the consumer's anonymous manifest request
+        if: steps.decide.outputs.build == 'true'
+        env:
+          V: ${{ steps.up.outputs.version }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          repo="${OWNER}/hf-cli"
+          tok="$(curl -fsS "https://ghcr.io/token?service=ghcr.io&scope=repository:${repo}:pull" | jq -er .token)"
+          code="$(curl -s -o /tmp/m.json -w '%{http_code}' \
+            -H "Authorization: Bearer ${tok}" -H "Accept: ${CONSUMER_ACCEPT}" \
+            "https://ghcr.io/v2/${repo}/manifests/${V}")"
+          echo "anonymous manifest request -> HTTP ${code}"
+          [ "$code" = "200" ] || { echo "::error::consumer replay got HTTP ${code}; the package is probably still private"; exit 1; }
+          mt="$(jq -r '.mediaType // "none"' /tmp/m.json)"
+          echo "mediaType -> ${mt}"
+          case "$mt" in
+            application/vnd.docker.distribution.manifest.v2+json) ;;
+            application/vnd.docker.distribution.manifest.list.v2+json) ;;
+            *) echo "::error::mediaType '${mt}' is not parseable by the consumer"; exit 1 ;;
+          esac
+
+      # Only now, after the published image is proven consumable, does the floating tag move.
+      - name: Move latest
+        if: steps.decide.outputs.build == 'true'
+        env:
+          V: ${{ steps.up.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker tag "${IMAGE}:${V}" "${IMAGE}:latest"
+          docker push "${IMAGE}:latest"
+
+      # Audit ref, and the repository activity that keeps the cron alive past 60 days.
+      - name: Tag the release in git
+        if: steps.decide.outputs.build == 'true'
+        env:
+          V: ${{ steps.up.outputs.version }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/${V}" >/dev/null 2>&1; then
+            echo "::notice::git tag ${V} already exists"
+          else
+            git tag "${V}"
+            git push origin "refs/tags/${V}"
+          fi
+
+      - name: Summary
+        if: always()
+        env:
+          V: ${{ steps.up.outputs.version }}
+          BUILT: ${{ steps.decide.outputs.build }}
+        run: |
+          {
+            echo "### hf-cli"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Upstream huggingface_hub | \`${V}\` |"
+            echo "| Built this run | ${BUILT:-n/a} |"
+            echo "| Image | \`${IMAGE}\` |"
+          } >> "${GITHUB_STEP_SUMMARY:-/tmp/summary.md}"
