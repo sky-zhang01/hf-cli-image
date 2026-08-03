@@ -12,6 +12,9 @@ FROM python:3.13-slim
 # `:?` makes a missing build-arg a hard build failure, so a build can never silently produce
 # an image whose tag would not match the version actually installed inside it.
 ARG HF_VERSION
+# Recorded in the image so `docker inspect` alone identifies the recipe commit.
+# This is what replaces a separate sha-<gitsha> image tag.
+ARG GIT_SHA=unknown
 RUN pip install --no-cache-dir "huggingface_hub==${HF_VERSION:?HF_VERSION build-arg is required}"
 
 # hf-xet is a default dependency of huggingface_hub on x86_64/arm64, so the Xet
@@ -26,6 +29,7 @@ ENV HF_HUB_DISABLE_TELEMETRY=1 \
 
 LABEL org.opencontainers.image.title="hf-cli" \
       org.opencontainers.image.version="${HF_VERSION}" \
+      org.opencontainers.image.revision="${GIT_SHA}" \
       org.opencontainers.image.source="https://github.com/huggingface/huggingface_hub" \
       org.opencontainers.image.description="Official huggingface_hub CLI (hf), packaged as a container image"
 

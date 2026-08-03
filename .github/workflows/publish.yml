@@ -97,6 +97,7 @@ jobs:
           set -euo pipefail
           docker buildx build --load \
             --build-arg "HF_VERSION=${V}" \
+            --build-arg "GIT_SHA=${GITHUB_SHA}" \
             --tag "${IMAGE}:${V}" .
 
       - name: Prove the image before anything is publishable
