@@ -19,8 +19,7 @@ on:
         default: false
 
 permissions:
-  contents: write   # push the git tag (this is also the repository activity that keeps a
-                    # scheduled workflow from being auto-disabled after 60 quiet days)
+  contents: write   # git tag, GitHub Release, and the keepalive commit
   packages: write   # push to GHCR
 
 concurrency:
@@ -29,11 +28,12 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/hf-cli
-  # The exact Accept list sent by the intended consumer's image-update check. Its digest
-  # parser only handles these two Docker schema2 types; an OCI image manifest or an OCI
-  # index falls through to an empty result with no error and no log, which would make new
-  # versions permanently undetectable. The gate below replays this byte-for-byte.
-  CONSUMER_ACCEPT: 'application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v1+json, application/vnd.oci.image.index.v1+json'
+  REGISTRY_REPO: ${{ github.repository_owner }}/hf-cli
+  # Accept list for manifest probes. The digest comparisons here — and the consumer's own
+  # update check (TrueNAS 25.10.5, verified in its middleware source) — read the
+  # Docker-Content-Digest response header, so the exact media types listed are not
+  # load-bearing; this simply matches what common clients send.
+  MANIFEST_ACCEPT: 'application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json'
 
 jobs:
   track-and-publish:
@@ -66,29 +66,73 @@ jobs:
           GHCR_TOKEN: ${{ github.token }}
         run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
-      - name: Decide whether to build
+      # The registry is the state store: no state file of our own can disagree with it.
+      # Probes branch on the HTTP status code because `docker manifest inspect` cannot
+      # distinguish "tag not published" (rc=1) from "registry unreachable" (also rc=1,
+      # stderr discarded) — and that ambiguity fails toward rebuilding and silently
+      # overwriting a version tag this repository documents as immutable. An unexpected
+      # status is therefore a hard failure, for the same reason the PyPI step hard-fails:
+      # "assume unpublished" is indistinguishable from a registry outage.
+      - name: Decide what needs doing
         id: decide
         env:
           V: ${{ steps.up.outputs.version }}
           FORCE: ${{ inputs.force }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # The registry is the state store: no state file of our own can disagree with it.
-          # This is also what makes the version tag immutable in normal operation — an
-          # already-published version is never rebuilt unless `force` is used.
+          tok="$(curl -fsS --retry 3 --connect-timeout 10 \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:${REGISTRY_REPO}:pull" | jq -er .token)"
+          probe() {  # $1 = tag; prints "<http-code> <digest-or-none>"
+            local hdr code digest
+            hdr="$(mktemp)"
+            code="$(curl -sS --retry 3 --connect-timeout 10 -I -D "${hdr}" -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${tok}" -H "Accept: ${MANIFEST_ACCEPT}" \
+              "https://ghcr.io/v2/${REGISTRY_REPO}/manifests/${1}")" || code="000"
+            digest="$(awk 'tolower($1)=="docker-content-digest:" {print $2}' "${hdr}" | tr -d '\r')"
+            printf '%s %s\n' "${code}" "${digest:-none}"
+          }
+          read -r vcode vdigest <<<"$(probe "${V}")"
+          read -r lcode ldigest <<<"$(probe latest)"
+          echo "::notice::${V} -> HTTP ${vcode} ${vdigest}; latest -> HTTP ${lcode} ${ldigest}"
+          case "$vcode" in 200|404) ;; *) echo "::error::registry probe for ${V} returned HTTP ${vcode} — refusing to guess"; exit 1 ;; esac
+          case "$lcode" in 200|404) ;; *) echo "::error::registry probe for latest returned HTTP ${lcode} — refusing to guess"; exit 1 ;; esac
+
+          build=false
+          [ "$vcode" = "404" ] && build=true
+          # An already-published version is never rebuilt unless `force` is used — this is
+          # what makes the version tag immutable in normal operation.
           if [ "$FORCE" = "true" ]; then
-            echo "build=true" >> "$GITHUB_OUTPUT"
+            build=true
             echo "::warning::force=true — an existing ${V} tag will be overwritten"
-          elif docker manifest inspect "${IMAGE}:${V}" >/dev/null 2>&1; then
-            echo "build=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::${IMAGE}:${V} already published — nothing to do"
-          else
-            echo "build=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # --load, never --push. A bare `docker buildx build --push` emits OCI media types,
-      # which the consumer cannot parse. Building into the local image store and pushing
-      # from there yields application/vnd.docker.distribution.manifest.v2+json.
+          # Reconcile: the invariant the consumer depends on is "latest points at the digest
+          # of the newest version", not merely "the version tag exists". A run that dies
+          # between pushing the version tag and moving latest must be healed by the NEXT
+          # run, not by the next upstream release. Missing git tag / GitHub Release heal
+          # the same way.
+          tag_missing=true
+          git ls-remote --exit-code --tags origin "refs/tags/${V}" >/dev/null 2>&1 && tag_missing=false
+          rel_missing=true
+          gh release view "${V}" >/dev/null 2>&1 && rel_missing=false
+          sync=false
+          if [ "$build" = "true" ] || [ "$vdigest" != "$ldigest" ] \
+             || [ "$tag_missing" = "true" ] || [ "$rel_missing" = "true" ]; then
+            sync=true
+          fi
+          [ "$sync" = "false" ] && echo "::notice::${IMAGE}:${V} published and fully synced — nothing to do"
+          {
+            echo "build=$build"
+            echo "sync=$sync"
+          } >> "$GITHUB_OUTPUT"
+
+      # --load then push: the image must exist in the local store so the prove step can run
+      # it before anything reaches the registry. (This path also happens to publish Docker
+      # schema2 manifests. The earlier belief that the TrueNAS consumer cannot detect OCI
+      # manifests was checked against TrueNAS 25.10.5 middleware source and is wrong — its
+      # updater compares the Docker-Content-Digest header and never parses the manifest
+      # body. schema2 is a harmless side effect here, not a requirement.)
       - name: Build locally
         if: steps.decide.outputs.build == 'true'
         env:
@@ -119,44 +163,54 @@ jobs:
           V: ${{ steps.up.outputs.version }}
         run: docker push "${IMAGE}:${V}"
 
-      # The load-bearing gate. Replays the consumer's own anonymous request, with its exact
-      # Accept list, against the tag just published. Without this the whole pipeline can run
-      # green while the consumer stays permanently blind to new versions.
-      - name: Gate — replay the consumer's anonymous manifest request
-        if: steps.decide.outputs.build == 'true'
+      # The consumer's update check is anonymous. If the GHCR package is (or ever again
+      # becomes) private, everything above still succeeds while the consumer silently stops
+      # seeing new versions — a newly created GHCR package defaults to private, which is
+      # exactly how this failed during initial setup. Hard-fail on anything but HTTP 200
+      # before latest is allowed to move.
+      - name: Gate — the published tag must be anonymously pullable
+        if: steps.decide.outputs.sync == 'true'
         env:
           V: ${{ steps.up.outputs.version }}
-          OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
-          repo="${OWNER}/hf-cli"
-          tok="$(curl -fsS "https://ghcr.io/token?service=ghcr.io&scope=repository:${repo}:pull" | jq -er .token)"
-          code="$(curl -s -o /tmp/m.json -w '%{http_code}' \
-            -H "Authorization: Bearer ${tok}" -H "Accept: ${CONSUMER_ACCEPT}" \
-            "https://ghcr.io/v2/${repo}/manifests/${V}")"
+          tok="$(curl -fsS --retry 3 --connect-timeout 10 \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:${REGISTRY_REPO}:pull" | jq -er .token)"
+          code="$(curl -sS --retry 3 --connect-timeout 10 -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${tok}" -H "Accept: ${MANIFEST_ACCEPT}" \
+            "https://ghcr.io/v2/${REGISTRY_REPO}/manifests/${V}")"
           echo "anonymous manifest request -> HTTP ${code}"
-          [ "$code" = "200" ] || { echo "::error::consumer replay got HTTP ${code}; the package is probably still private"; exit 1; }
-          mt="$(jq -r '.mediaType // "none"' /tmp/m.json)"
-          echo "mediaType -> ${mt}"
-          case "$mt" in
-            application/vnd.docker.distribution.manifest.v2+json) ;;
-            application/vnd.docker.distribution.manifest.list.v2+json) ;;
-            *) echo "::error::mediaType '${mt}' is not parseable by the consumer"; exit 1 ;;
-          esac
+          [ "$code" = "200" ] || { echo "::error::anonymous pull of ${V} got HTTP ${code}; is the package private?"; exit 1; }
 
-      # Only now, after the published image is proven consumable, does the floating tag move.
+      # Registry-side tag copy: works both when this run built the image and when it is only
+      # reconciling a half-finished earlier publish (no local image needed), and it re-points
+      # latest at the exact manifest the version tag already serves. The digest assertion
+      # afterwards is the product invariant, checked directly.
       - name: Move latest
-        if: steps.decide.outputs.build == 'true'
+        if: steps.decide.outputs.sync == 'true'
         env:
           V: ${{ steps.up.outputs.version }}
         run: |
           set -euo pipefail
-          docker tag "${IMAGE}:${V}" "${IMAGE}:latest"
-          docker push "${IMAGE}:latest"
+          docker buildx imagetools create -t "${IMAGE}:latest" "${IMAGE}:${V}"
+          tok="$(curl -fsS --retry 3 --connect-timeout 10 \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:${REGISTRY_REPO}:pull" | jq -er .token)"
+          d() {
+            curl -sS --retry 3 --connect-timeout 10 -I \
+              -H "Authorization: Bearer ${tok}" -H "Accept: ${MANIFEST_ACCEPT}" \
+              "https://ghcr.io/v2/${REGISTRY_REPO}/manifests/${1}" \
+              | awk 'tolower($1)=="docker-content-digest:" {print $2}' | tr -d '\r'
+          }
+          vd="$(d "${V}")"
+          ld="$(d latest)"
+          echo "digest ${V} -> ${vd}; latest -> ${ld}"
+          [ -n "$vd" ] && [ "$vd" = "$ld" ] || { echo "::error::latest (${ld}) != ${V} (${vd}) after move"; exit 1; }
 
-      # Audit ref, and the repository activity that keeps the cron alive past 60 days.
+      # Audit ref for the recipe. Create-only: a `force` rebuild of an existing version does
+      # not move it — the authoritative recipe pointer for any published image is its
+      # org.opencontainers.image.revision label.
       - name: Tag the release in git
-        if: steps.decide.outputs.build == 'true'
+        if: steps.decide.outputs.sync == 'true'
         env:
           V: ${{ steps.up.outputs.version }}
         run: |
@@ -168,11 +222,51 @@ jobs:
             git push origin "refs/tags/${V}"
           fi
 
+      - name: Ensure the GitHub Release exists
+        if: steps.decide.outputs.sync == 'true'
+        env:
+          V: ${{ steps.up.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "${V}" >/dev/null 2>&1; then
+            echo "::notice::release ${V} already exists"
+          else
+            gh release create "${V}" --verify-tag \
+              --title "hf-cli ${V}" \
+              --notes "Packages upstream [huggingface_hub ${V}](https://github.com/huggingface/huggingface_hub/releases/tag/v${V}) as \`${IMAGE}:${V}\`. \`latest\` now points at this version."
+          fi
+
+      # GitHub disables the schedule in a public repository after 60 days without repository
+      # activity, and a tag push does NOT count — verified against this repo's own
+      # /activity API (a real tag push left no record while branch pushes did), and matching
+      # community precedent for tag-only repos. Only default-branch commits reliably reset
+      # the clock, so: an unconditional, age-gated keepalive commit. A push made with
+      # GITHUB_TOKEN does not retrigger this workflow.
+      - name: Keepalive — the schedule dies after 60 quiet days, and tag pushes do not count
+        env:
+          KEEPALIVE_AFTER_DAYS: 40
+        run: |
+          set -euo pipefail
+          last="$(git log -1 --format=%ct)"
+          age_days="$(( ( $(date +%s) - last ) / 86400 ))"
+          echo "default-branch HEAD is ${age_days} days old"
+          if [ "${age_days}" -lt "${KEEPALIVE_AFTER_DAYS}" ]; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          date -u '+%Y-%m-%dT%H:%M:%SZ' > .github/keepalive
+          git add .github/keepalive
+          git commit -m "chore: keepalive — a public repo's schedule is disabled after 60 quiet days"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
       - name: Summary
         if: always()
         env:
           V: ${{ steps.up.outputs.version }}
           BUILT: ${{ steps.decide.outputs.build }}
+          SYNCED: ${{ steps.decide.outputs.sync }}
         run: |
           {
             echo "### hf-cli"
@@ -181,5 +275,6 @@ jobs:
             echo "| --- | --- |"
             echo "| Upstream huggingface_hub | \`${V}\` |"
             echo "| Built this run | ${BUILT:-n/a} |"
+            echo "| Sync work this run | ${SYNCED:-n/a} |"
             echo "| Image | \`${IMAGE}\` |"
           } >> "${GITHUB_STEP_SUMMARY:-/tmp/summary.md}"

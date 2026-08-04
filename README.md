@@ -16,12 +16,16 @@ publish a container image for the CLI.
 extra — so the Xet content-addressed transport is active out of the box. Xet is Hugging Face's
 current transport layer and replaces the older `hf_transfer` acceleration path.
 
-## Tags
+## Tags and releases
 
 | Tag | Meaning |
 | --- | --- |
 | `<upstream-version>` e.g. `1.26.0` | Exactly one upstream `huggingface_hub` release |
 | `latest` | The most recent successfully published version |
+
+Every published version also gets a git tag and a GitHub Release of the same name. The image
+tag is the delivery artifact; the git tag and Release are audit refs — the authoritative
+recipe pointer for any published image is its `org.opencontainers.image.revision` label.
 
 The version tag is immutable in normal operation: the workflow refuses to build a version whose
 tag already resolves in the registry. The only way to overwrite one is a manual
@@ -37,29 +41,45 @@ passes it in, so there is nothing for Renovate or Dependabot to bump.
 ```text
 scheduled run (every 6h)
   → resolve version from PyPI
-  → already published?  →  exit
-  → build locally, prove it, publish the version tag
-  → replay the consumer's manifest request
-  → move `latest`, tag the release in git
+  → probe registry by HTTP status: version tag + latest digest
+  → published AND latest/git-tag/Release all in sync?  →  exit
+  → build locally, prove it, publish the version tag   (build only if the tag is absent)
+  → gate: the tag must be anonymously pullable
+  → re-point `latest` (registry-side copy), assert latest digest == version digest
+  → ensure git tag + GitHub Release
+  → keepalive commit if the default branch has been quiet ~40 days
 ```
 
-The registry is the state store. "Is this version already published" is one manifest request;
-a separate state file could only disagree with it.
+The registry is the state store, and every step after the probe is a reconcile: a run that
+dies halfway is healed by the next run, not by the next upstream release. Registry probes
+branch on the HTTP status code and hard-fail on anything but 200/404 — "assume unpublished"
+is indistinguishable from a registry outage and would silently overwrite an immutable tag.
 
-## The two things that make or break this pipeline
+## The three ways this pipeline can rot silently
 
-**1. The image manifest must be Docker schema2.** The intended consumer's image-update check
-sends a fixed `Accept` list and its digest parser handles only
-`application/vnd.docker.distribution.manifest.v2+json` and
-`...manifest.list.v2+json`. An OCI image manifest — which a bare
-`docker buildx build --push` produces by default — falls through to an empty result **with no
-error and no log**, leaving new versions permanently undetectable. The workflow therefore
-builds with `--load` and pushes from the local image store, and a gate replays the consumer's
-exact anonymous request before `latest` is allowed to move.
-
-**2. The GHCR package must be public.** A newly created package defaults to private. Until it
+**1. The GHCR package must be public.** A newly created package defaults to private. Until it
 is made public the consumer's anonymous check keeps failing in a way that looks exactly like a
-code bug. The gate above turns that into a loud build failure rather than a silent one.
+code bug. The gate before `latest` moves turns that into a loud build failure rather than a
+silent one.
+
+**2. `latest` must actually equal the newest version.** The consumer watches the `latest`
+digest, so "the version tag exists" is not the invariant that matters. The workflow asserts
+`latest digest == version digest` after every move and reconciles on every run.
+
+**3. GitHub disables the cron after 60 quiet days — and tag pushes do not count.** In a public
+repository, scheduled workflows are auto-disabled after 60 days without repository activity.
+Verified against this repo's own `/activity` API: a real tag push leaves no activity record,
+while branch pushes do — so a tag-only repo dies on schedule regardless of upstream cadence.
+The workflow therefore makes an unconditional, age-gated keepalive commit (at most one per ~40
+days). One historical false belief is documented here so it does not come back: the image
+manifest does **not** need to be Docker schema2 — TrueNAS 25.10.5's updater compares the
+`Docker-Content-Digest` response header and never parses the manifest body, so OCI manifests
+are detected just as well. The `--load`-then-push build path is kept because the local smoke
+test needs the image in the local store, not for its media type.
+
+Known accepted edge: the pipeline publishes whatever PyPI reports as the current release. If
+upstream yanks its newest release, PyPI reports the previous one, which is already published —
+`latest` keeps serving the yanked version until the next upstream release.
 
 ## Using it
 
