@@ -51,10 +51,14 @@ jobs:
             https://pypi.org/pypi/huggingface_hub/json | jq -er '.info.version')"
           case "$version" in ''|null) echo "::error::could not resolve upstream version"; exit 1 ;; esac
           # This value comes from a third party and then reaches `docker tag` and `git tag`.
-          # Constrain it to a PEP 440-ish release string so no metacharacter can ride along,
-          # and so a reshaped API response fails loudly instead of producing a junk tag.
-          if ! printf '%s' "$version" | grep -Eq '^[0-9]+(\.[0-9]+)*((a|b|rc|\.post|\.dev)[0-9]+)?$'; then
-            echo "::error::refusing unexpected version string from PyPI: ${version}"
+          # Constrain it to a PEP 440 final/post release so no metacharacter can ride along
+          # and a reshaped API response fails loudly instead of producing a junk tag.
+          # Pre-releases (a/b/rc/.dev) are rejected on purpose: PyPI's info.version has been
+          # verified not to surface them, so one showing up here means the API changed shape
+          # or upstream changed policy — either way `latest` must never move to an RC
+          # silently. Post-releases (e.g. 1.26.0.post1) are real stable re-releases and pass.
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+(\.[0-9]+)*(\.post[0-9]+)?$'; then
+            echo "::error::refusing non-final version string from PyPI: ${version}"
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
