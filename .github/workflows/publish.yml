@@ -182,17 +182,23 @@ jobs:
           echo "anonymous manifest request -> HTTP ${code}"
           [ "$code" = "200" ] || { echo "::error::anonymous pull of ${V} got HTTP ${code}; is the package private?"; exit 1; }
 
-      # Registry-side tag copy: works both when this run built the image and when it is only
-      # reconciling a half-finished earlier publish (no local image needed), and it re-points
-      # latest at the exact manifest the version tag already serves. The digest assertion
-      # afterwards is the product invariant, checked directly.
+      # Move latest by pulling the published image and re-pushing it under the latest tag —
+      # same config + layers reproduce the identical manifest bytes, so both tags resolve to
+      # one digest. `docker buildx imagetools create` is NOT suitable here: it wraps the
+      # source manifest in a new OCI index with its own digest (observed live, run
+      # 30898357186, caught by the assertion below). Pull-tag-push works both when this run
+      # built the image (pull is a cheap re-verify) and when it is only reconciling a
+      # half-finished earlier publish. The digest assertion afterwards is the product
+      # invariant, checked directly.
       - name: Move latest
         if: steps.decide.outputs.sync == 'true'
         env:
           V: ${{ steps.up.outputs.version }}
         run: |
           set -euo pipefail
-          docker buildx imagetools create -t "${IMAGE}:latest" "${IMAGE}:${V}"
+          docker pull "${IMAGE}:${V}"
+          docker tag "${IMAGE}:${V}" "${IMAGE}:latest"
+          docker push "${IMAGE}:latest"
           tok="$(curl -fsS --retry 3 --connect-timeout 10 \
             "https://ghcr.io/token?service=ghcr.io&scope=repository:${REGISTRY_REPO}:pull" | jq -er .token)"
           d() {
