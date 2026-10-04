@@ -20,40 +20,65 @@ current transport layer and replaces the older `hf_transfer` acceleration path.
 
 | Tag | Meaning |
 | --- | --- |
-| `<upstream-version>` e.g. `1.26.0` | Exactly one upstream `huggingface_hub` release |
-| `latest` | The most recent successfully published version |
+| `<upstream-version>` e.g. `2.1.1` | The verified build of that upstream `huggingface_hub` release |
+| `latest` | The current upstream version selected by CI |
 
 Every published version also gets a git tag and a GitHub Release of the same name. The image
 tag is the delivery artifact; the git tag and Release are audit refs — the authoritative
 recipe pointer for any published image is its `org.opencontainers.image.revision` label.
 
-The version tag is immutable in normal operation: the workflow refuses to build a version whose
-tag already resolves in the registry. The only way to overwrite one is a manual
-`workflow_dispatch` with `force=true`, which is deliberate and logged as a warning.
+Version tags are refreshed when the recipe changes on `main`, during the weekly dependency
+refresh, or with manual `workflow_dispatch` and `force=true`. The HF version can stay the same
+while Python, base packages or upstream-allowed dependencies change. Each refresh uses
+`--pull --no-cache`, verifies the image before publishing, and moves `latest` last.
+
+Use the image digest for an exact rollback, including rebuilds from the same recipe commit:
+
+```bash
+docker pull ghcr.io/sky-zhang01/hf-cli@sha256:<recorded-digest>
+```
+
+CI logs record the installed package list and build metadata. The run summary records the
+pinned base reference, recipe SHA, previous tag digests and published digest.
+Git version tags remain create-only audit refs;
+the image's revision label identifies the recipe, while its digest identifies the built artifact.
 
 ## How upstream tracking works
 
-There is no dependency bot here, and none is needed — **the version is not stored in this
-repository at all**. `ARG HF_VERSION` has no default, and `${HF_VERSION:?}` makes a missing
-build-arg a hard build failure. CI resolves the current release from the PyPI JSON API and
-passes it in, so there is nothing for Renovate or Dependabot to bump.
+The HF version is not stored in this repository. `ARG HF_VERSION` has no default, and
+`${HF_VERSION:?}` makes a missing build-arg a hard build failure. CI resolves the current final
+or post release from the PyPI JSON API and validates the complete string before using it.
+Dependabot independently opens weekly PRs for the literal Python base tag/digest and the
+SHA-pinned workflow actions; it does not duplicate HF discovery. Runtime upgrades use the
+newest supported stable release compatible with HF, without prereleases.
 
 ```text
 scheduled run (every 6h)
   → resolve version from PyPI
   → probe registry by HTTP status: version tag + latest digest
   → published AND latest/git-tag/Release all in sync?  →  exit
-  → build locally, prove it, publish the version tag   (build only if the tag is absent)
+  → build locally, prove it, publish the version tag   (if absent or refresh requested)
   → gate: the tag must be anonymously pullable
-  → re-point `latest` (registry-side copy), assert latest digest == version digest
+  → pull the exact published digest, move `latest`, assert both tags equal that digest
   → ensure git tag + GitHub Release
   → keepalive commit if the default branch has been quiet ~40 days
 ```
 
+The same workflow refreshes the current version every Sunday and when recipe changes reach
+`main`. PRs and recipe pushes run a separate job with read-only permissions: it builds the
+image, verifies exact Python/HF metadata and `pip check`, downloads a pinned public README
+over HTTPS, and downloads a 454 KB Xet fixture through the real native `hf-xet` CAS transport.
+The Xet check rejects HTTP fallback, checks size/SHA256, then verifies online cache reuse and
+offline reuse. PR jobs never publish or receive publishing credentials. The publishing job
+performs the same verification on its own build before pushing.
+Immediately before publishing either tag, CI checks that remote `main` still equals the
+recipe SHA, so a queued run cannot publish an outdated recipe over a newer commit.
+
 The registry is the state store, and every step after the probe is a reconcile: a run that
 dies halfway is healed by the next run, not by the next upstream release. Registry probes
-branch on the HTTP status code and hard-fail on anything but 200/404 — "assume unpublished"
-is indistinguishable from a registry outage and would silently overwrite an immutable tag.
+branch on the HTTP status code and hard-fail on anything but 200/404. A 200 response must
+contain exactly one valid SHA256 digest; a missing `latest` always requires reconciliation.
+Git tag and Release queries also distinguish a missing object from a network or API failure.
 
 ## The three ways this pipeline can rot silently
 
@@ -71,15 +96,16 @@ repository, scheduled workflows are auto-disabled after 60 days without reposito
 Verified against this repo's own `/activity` API: a real tag push leaves no activity record,
 while branch pushes do — so a tag-only repo dies on schedule regardless of upstream cadence.
 The workflow therefore makes an unconditional, age-gated keepalive commit (at most one per ~40
-days). One historical false belief is documented here so it does not come back: the image
-manifest does **not** need to be Docker schema2 — TrueNAS 25.10.5's updater compares the
-`Docker-Content-Digest` response header and never parses the manifest body, so OCI manifests
-are detected just as well. The `--load`-then-push build path is kept because the local smoke
-test needs the image in the local store, not for its media type.
+days). The `--load`-then-push build path keeps the image in the local store for verification.
+Release behavior does not depend on a particular host's model serving or update mechanism.
 
-Known accepted edge: the pipeline publishes whatever PyPI reports as the current release. If
-upstream yanks its newest release, PyPI reports the previous one, which is already published —
-`latest` keeps serving the yanked version until the next upstream release.
+The pipeline follows the stable version PyPI currently reports. If PyPI reports an older
+already-published version, reconciliation moves `latest` back to that version's digest. This
+also applies if upstream withdraws a release; CI does not silently keep a newer version in
+preference to the current upstream report.
+
+GitHub and Gitea are independently maintained. Their changes are synchronized only when the
+owner explicitly requests synchronization.
 
 ## Using it
 
@@ -99,8 +125,7 @@ a one-shot and as a long-running container.
 Notes:
 
 - Runs as `568:568`, a non-root uid/gid, so downloaded files are not owned by root.
-- Mount the directory your serving stack already reads models from, so a finished download
-  needs no copy or move step.
+- Mount the directory where you want downloaded files to persist.
 - Point `HF_HOME` inside that same mount to keep the cache and partial blobs on the same
   filesystem as the final files.
 - Supply `HF_TOKEN` through an `env_file`, never in a compose file.

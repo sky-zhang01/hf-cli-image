@@ -1,152 +1,134 @@
 name: Track upstream and publish
 
-# No dependency bot is involved: tracking upstream is this repository's own function, so
-# there is no pinned version for Renovate or Dependabot to bump.
-#
-# Everything happens in ONE job on purpose. A push made with GITHUB_TOKEN does not trigger
-# further workflow runs, so a "detect -> commit -> build" split across jobs would silently
-# never build, and working around that would cost a PAT this repository does not need.
+# HF discovery stays here. Dependabot only maintains the Python base and actions.
+# The publish job verifies its local build before any registry tag can move.
 on:
+  pull_request:
+    branches: [main]
+    paths: [Dockerfile, '.github/**', 'scripts/**']
+  push:
+    paths: [Dockerfile, '.github/**', 'scripts/**']
   schedule:
-    # Every 6h rather than daily: GitHub may drop scheduled runs under load, and four
-    # attempts a day bound a dropped run at ~6h. Upstream ships roughly weekly.
+    # HF release detection and a weekly refresh of upstream-allowed dependencies.
     - cron: '23 */6 * * *'
+    - cron: '47 3 * * 0'
   workflow_dispatch:
     inputs:
       force:
-        description: 'Rebuild and overwrite even if this version is already published'
+        description: 'Refresh the base and allowed dependencies for the current HF version'
         type: boolean
         default: false
 
 permissions:
-  contents: write   # git tag, GitHub Release, and the keepalive commit
-  packages: write   # push to GHCR
+  contents: read
 
 concurrency:
-  group: publish
+  group: ${{ github.ref == 'refs/heads/main' && 'publish' || github.ref }}
   cancel-in-progress: false
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/hf-cli
   REGISTRY_REPO: ${{ github.repository_owner }}/hf-cli
-  # Accept list for manifest probes. The digest comparisons here — and the consumer's own
-  # update check (TrueNAS 25.10.5, verified in its middleware source) — read the
-  # Docker-Content-Digest response header, so the exact media types listed are not
-  # load-bearing; this simply matches what common clients send.
+  SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
   MANIFEST_ACCEPT: 'application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json'
 
 jobs:
-  track-and-publish:
+  verify:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - name: Verify maintenance boundary checks
+        run: bash .github/scripts/test-maintenance.sh
+      - name: Build and verify the recipe without publishing
+        env:
+          BUILD_METADATA: ${{ runner.temp }}/hf-verify-build.json
+        run: |
+          set -euo pipefail
+          source .github/scripts/maintenance.sh
+          version="$(curl -fsS --retry 3 --connect-timeout 10 https://pypi.org/pypi/huggingface_hub/json | resolve_version)"
+          ref="hf-cli-check:${SOURCE_SHA}"
+          build_image "$ref" "$version"
+          bash scripts/verify-image.sh "$ref" "$version"
+
+  track-and-publish:
+    needs: verify
+    if: >-
+      always() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' &&
+      (needs.verify.result == 'success' || needs.verify.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify maintenance boundary checks
+        run: bash .github/scripts/test-maintenance.sh
 
       - name: Resolve the upstream release
         id: up
         run: |
           set -euo pipefail
-          # Hard-fail on an unreachable or reshaped PyPI response. Falling back to
-          # "assume unchanged" would be indistinguishable from "there is no new release".
+          source .github/scripts/maintenance.sh
           version="$(curl -fsS --retry 3 --connect-timeout 10 \
-            https://pypi.org/pypi/huggingface_hub/json | jq -er '.info.version')"
-          case "$version" in ''|null) echo "::error::could not resolve upstream version"; exit 1 ;; esac
-          # This value comes from a third party and then reaches `docker tag` and `git tag`.
-          # Constrain it to a PEP 440 final/post release so no metacharacter can ride along
-          # and a reshaped API response fails loudly instead of producing a junk tag.
-          # Pre-releases (a/b/rc/.dev) are rejected on purpose: PyPI's info.version has been
-          # verified not to surface them, so one showing up here means the API changed shape
-          # or upstream changed policy — either way `latest` must never move to an RC
-          # silently. Post-releases (e.g. 1.26.0.post1) are real stable re-releases and pass.
-          if ! printf '%s' "$version" | grep -Eq '^[0-9]+(\.[0-9]+)*(\.post[0-9]+)?$'; then
-            echo "::error::refusing non-final version string from PyPI: ${version}"
-            exit 1
-          fi
+            https://pypi.org/pypi/huggingface_hub/json | resolve_version)"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "::notice::upstream huggingface_hub == $version"
 
-      - name: Log in to GHCR
-        env:
-          GHCR_USER: ${{ github.actor }}
-          GHCR_TOKEN: ${{ github.token }}
-        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-
-      # The registry is the state store: no state file of our own can disagree with it.
-      # Probes branch on the HTTP status code because `docker manifest inspect` cannot
-      # distinguish "tag not published" (rc=1) from "registry unreachable" (also rc=1,
-      # stderr discarded) — and that ambiguity fails toward rebuilding and silently
-      # overwriting a version tag this repository documents as immutable. An unexpected
-      # status is therefore a hard failure, for the same reason the PyPI step hard-fails:
-      # "assume unpublished" is indistinguishable from a registry outage.
       - name: Decide what needs doing
         id: decide
         env:
           V: ${{ steps.up.outputs.version }}
-          FORCE: ${{ inputs.force }}
+          FORCE: ${{ inputs.force || false }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tok="$(curl -fsS --retry 3 --connect-timeout 10 \
-            "https://ghcr.io/token?service=ghcr.io&scope=repository:${REGISTRY_REPO}:pull" | jq -er .token)"
-          probe() {  # $1 = tag; prints "<http-code> <digest-or-none>"
-            local hdr code digest
-            hdr="$(mktemp)"
-            code="$(curl -sS --retry 3 --connect-timeout 10 -I -D "${hdr}" -o /dev/null -w '%{http_code}' \
-              -H "Authorization: Bearer ${tok}" -H "Accept: ${MANIFEST_ACCEPT}" \
-              "https://ghcr.io/v2/${REGISTRY_REPO}/manifests/${1}")" || code="000"
-            digest="$(awk 'tolower($1)=="docker-content-digest:" {print $2}' "${hdr}" | tr -d '\r')"
-            printf '%s %s\n' "${code}" "${digest:-none}"
-          }
-          read -r vcode vdigest <<<"$(probe "${V}")"
-          read -r lcode ldigest <<<"$(probe latest)"
+          source .github/scripts/maintenance.sh
+          tok="$(registry_token)"
+          version_probe="$(registry_probe "$V" "$tok")"
+          latest_probe="$(registry_probe latest "$tok")"
+          read -r vcode vdigest <<< "$version_probe"
+          read -r lcode ldigest <<< "$latest_probe"
           echo "::notice::${V} -> HTTP ${vcode} ${vdigest}; latest -> HTTP ${lcode} ${ldigest}"
-          case "$vcode" in 200|404) ;; *) echo "::error::registry probe for ${V} returned HTTP ${vcode} — refusing to guess"; exit 1 ;; esac
-          case "$lcode" in 200|404) ;; *) echo "::error::registry probe for latest returned HTTP ${lcode} — refusing to guess"; exit 1 ;; esac
-
-          build=false
-          [ "$vcode" = "404" ] && build=true
-          # An already-published version is never rebuilt unless `force` is used — this is
-          # what makes the version tag immutable in normal operation.
-          if [ "$FORCE" = "true" ]; then
-            build=true
-            echo "::warning::force=true — an existing ${V} tag will be overwritten"
-          fi
-
-          # Reconcile: the invariant the consumer depends on is "latest points at the digest
-          # of the newest version", not merely "the version tag exists". A run that dies
-          # between pushing the version tag and moving latest must be healed by the NEXT
-          # run, not by the next upstream release. Missing git tag / GitHub Release heal
-          # the same way.
           tag_missing=true
-          git ls-remote --exit-code --tags origin "refs/tags/${V}" >/dev/null 2>&1 && tag_missing=false
-          rel_missing=true
-          gh release view "${V}" >/dev/null 2>&1 && rel_missing=false
-          sync=false
-          if [ "$build" = "true" ] || [ "$vdigest" != "$ldigest" ] \
-             || [ "$tag_missing" = "true" ] || [ "$rel_missing" = "true" ]; then
-            sync=true
+          if git_tag_exists "$V"; then tag_missing=false; else
+            status=$?; [ "$status" = 1 ] || exit "$status"
           fi
+          rel_missing=true
+          if release_exists "$V"; then rel_missing=false; else
+            status=$?; [ "$status" = 1 ] || exit "$status"
+          fi
+          build="$(needs_build "$vcode" "$FORCE" "$EVENT_NAME" "$EVENT_SCHEDULE")"
+          sync="$(needs_sync "$build" "$lcode" "$vdigest" "$ldigest" "$tag_missing" "$rel_missing")"
+          echo "::notice::build=${build}, event=${EVENT_NAME}, schedule=${EVENT_SCHEDULE}, force=${FORCE}"
           [ "$sync" = "false" ] && echo "::notice::${IMAGE}:${V} published and fully synced — nothing to do"
           {
             echo "build=$build"
             echo "sync=$sync"
+            echo "version_digest=$vdigest"
+            echo "latest_digest=$ldigest"
           } >> "$GITHUB_OUTPUT"
 
-      # --load then push: the image must exist in the local store so the prove step can run
-      # it before anything reaches the registry. (This path also happens to publish Docker
-      # schema2 manifests. The earlier belief that the TrueNAS consumer cannot detect OCI
-      # manifests was checked against TrueNAS 25.10.5 middleware source and is wrong — its
-      # updater compares the Docker-Content-Digest header and never parses the manifest
-      # body. schema2 is a harmless side effect here, not a requirement.)
       - name: Build locally
+        id: build
         if: steps.decide.outputs.build == 'true'
         env:
           V: ${{ steps.up.outputs.version }}
+          BUILD_METADATA: ${{ runner.temp }}/hf-publish-build.json
         run: |
           set -euo pipefail
-          docker buildx build --load \
-            --build-arg "HF_VERSION=${V}" \
-            --build-arg "GIT_SHA=${GITHUB_SHA}" \
-            --tag "${IMAGE}:${V}" .
+          source .github/scripts/maintenance.sh
+          build_image "${IMAGE}:${V}" "$V"
+          config_id="$(jq -er '."containerimage.config.digest"' "$BUILD_METADATA")"
+          echo "config_id=$config_id" >> "$GITHUB_OUTPUT"
 
       - name: Prove the image before anything is publishable
         if: steps.decide.outputs.build == 'true'
@@ -154,67 +136,76 @@ jobs:
           V: ${{ steps.up.outputs.version }}
         run: |
           set -euo pipefail
-          got="$(docker run --rm "${IMAGE}:${V}" hf version)"
-          echo "hf version -> ${got}"
-          printf '%s' "$got" | grep -q "${V}"
+          bash scripts/verify-image.sh "${IMAGE}:${V}" "$V"
           label="$(docker inspect "${IMAGE}:${V}" \
             --format '{{index .Config.Labels "org.opencontainers.image.version"}}')"
           [ "$label" = "${V}" ] || { echo "::error::label '${label}' != '${V}'"; exit 1; }
 
-      - name: Push the immutable version tag
-        if: steps.decide.outputs.build == 'true'
-        env:
-          V: ${{ steps.up.outputs.version }}
-        run: docker push "${IMAGE}:${V}"
-
-      # The consumer's update check is anonymous. If the GHCR package is (or ever again
-      # becomes) private, everything above still succeeds while the consumer silently stops
-      # seeing new versions — a newly created GHCR package defaults to private, which is
-      # exactly how this failed during initial setup. Hard-fail on anything but HTTP 200
-      # before latest is allowed to move.
-      - name: Gate — the published tag must be anonymously pullable
+      - name: Log in to GHCR
         if: steps.decide.outputs.sync == 'true'
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+      - name: Push the verified version tag
+        if: steps.decide.outputs.build == 'true'
         env:
           V: ${{ steps.up.outputs.version }}
         run: |
           set -euo pipefail
-          tok="$(curl -fsS --retry 3 --connect-timeout 10 \
-            "https://ghcr.io/token?service=ghcr.io&scope=repository:${REGISTRY_REPO}:pull" | jq -er .token)"
-          code="$(curl -sS --retry 3 --connect-timeout 10 -o /dev/null -w '%{http_code}' \
-            -H "Authorization: Bearer ${tok}" -H "Accept: ${MANIFEST_ACCEPT}" \
-            "https://ghcr.io/v2/${REGISTRY_REPO}/manifests/${V}")"
-          echo "anonymous manifest request -> HTTP ${code}"
-          [ "$code" = "200" ] || { echo "::error::anonymous pull of ${V} got HTTP ${code}; is the package private?"; exit 1; }
+          source .github/scripts/maintenance.sh
+          assert_current_main
+          docker push "${IMAGE}:${V}"
 
-      # Move latest by pulling the published image and re-pushing it under the latest tag —
-      # same config + layers reproduce the identical manifest bytes, so both tags resolve to
-      # one digest. `docker buildx imagetools create` is NOT suitable here: it wraps the
-      # source manifest in a new OCI index with its own digest (observed live, run
-      # 30898357186, caught by the assertion below). Pull-tag-push works both when this run
-      # built the image (pull is a cheap re-verify) and when it is only reconciling a
-      # half-finished earlier publish. The digest assertion afterwards is the product
-      # invariant, checked directly.
+      - name: Gate — the published tag must be anonymously pullable
+        id: artifact
+        if: steps.decide.outputs.sync == 'true'
+        env:
+          V: ${{ steps.up.outputs.version }}
+          BUILT: ${{ steps.decide.outputs.build }}
+          PREVIOUS_DIGEST: ${{ steps.decide.outputs.version_digest }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/maintenance.sh
+          tok="$(registry_token)"
+          result="$(registry_probe "$V" "$tok")"
+          read -r code digest <<< "$result"
+          [ "$code" = 200 ] || { echo '::error::published version is absent'; exit 1; }
+          if [ "$BUILT" = false ] && [ "$digest" != "$PREVIOUS_DIGEST" ]; then
+            echo '::error::version digest changed during reconcile'; exit 1
+          fi
+          echo "Anonymous published artifact: ${IMAGE}@${digest}"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      # Pull the exact verified artifact; `latest` moves last and must retain its digest.
       - name: Move latest
         if: steps.decide.outputs.sync == 'true'
         env:
           V: ${{ steps.up.outputs.version }}
+          DIGEST: ${{ steps.artifact.outputs.digest }}
+          VERIFIED_CONFIG: ${{ steps.build.outputs.config_id }}
         run: |
           set -euo pipefail
-          docker pull "${IMAGE}:${V}"
-          docker tag "${IMAGE}:${V}" "${IMAGE}:latest"
+          source .github/scripts/maintenance.sh
+          tok="$(registry_token)"
+          published_config="$(registry_config "$DIGEST" "$tok")"
+          if [ -n "$VERIFIED_CONFIG" ] && [ "$published_config" != "$VERIFIED_CONFIG" ]; then
+            echo '::error::published config differs from the verified build metadata'; exit 1
+          fi
+          docker pull "${IMAGE}@${DIGEST}"
+          docker tag "${IMAGE}@${DIGEST}" "${IMAGE}:latest"
+          assert_current_main
           docker push "${IMAGE}:latest"
-          tok="$(curl -fsS --retry 3 --connect-timeout 10 \
-            "https://ghcr.io/token?service=ghcr.io&scope=repository:${REGISTRY_REPO}:pull" | jq -er .token)"
-          d() {
-            curl -sS --retry 3 --connect-timeout 10 -I \
-              -H "Authorization: Bearer ${tok}" -H "Accept: ${MANIFEST_ACCEPT}" \
-              "https://ghcr.io/v2/${REGISTRY_REPO}/manifests/${1}" \
-              | awk 'tolower($1)=="docker-content-digest:" {print $2}' | tr -d '\r'
+          tok="$(registry_token)"
+          version_probe="$(registry_probe "$V" "$tok")"
+          latest_probe="$(registry_probe latest "$tok")"
+          read -r vcode vd <<< "$version_probe"
+          read -r lcode ld <<< "$latest_probe"
+          echo "Readback ${V} -> HTTP ${vcode} ${vd}; latest -> HTTP ${lcode} ${ld}"
+          [ "$vcode" = 200 ] && [ "$lcode" = 200 ] && [ "$vd" = "$DIGEST" ] && [ "$ld" = "$DIGEST" ] || {
+            echo '::error::version/latest did not resolve to the published artifact'; exit 1;
           }
-          vd="$(d "${V}")"
-          ld="$(d latest)"
-          echo "digest ${V} -> ${vd}; latest -> ${ld}"
-          [ -n "$vd" ] && [ "$vd" = "$ld" ] || { echo "::error::latest (${ld}) != ${V} (${vd}) after move"; exit 1; }
 
       # Audit ref for the recipe. Create-only: a `force` rebuild of an existing version does
       # not move it — the authoritative recipe pointer for any published image is its
@@ -225,9 +216,11 @@ jobs:
           V: ${{ steps.up.outputs.version }}
         run: |
           set -euo pipefail
-          if git ls-remote --exit-code --tags origin "refs/tags/${V}" >/dev/null 2>&1; then
+          source .github/scripts/maintenance.sh
+          if git_tag_exists "$V"; then
             echo "::notice::git tag ${V} already exists"
           else
+            status=$?; [ "$status" = 1 ] || exit "$status"
             git tag "${V}"
             git push origin "refs/tags/${V}"
           fi
@@ -239,20 +232,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if gh release view "${V}" >/dev/null 2>&1; then
+          source .github/scripts/maintenance.sh
+          if release_exists "$V"; then
             echo "::notice::release ${V} already exists"
           else
+            status=$?; [ "$status" = 1 ] || exit "$status"
             gh release create "${V}" --verify-tag \
               --title "hf-cli ${V}" \
               --notes "Packages upstream [huggingface_hub ${V}](https://github.com/huggingface/huggingface_hub/releases/tag/v${V}) as \`${IMAGE}:${V}\`. \`latest\` now points at this version."
           fi
 
-      # GitHub disables the schedule in a public repository after 60 days without repository
-      # activity, and a tag push does NOT count — verified against this repo's own
-      # /activity API (a real tag push left no record while branch pushes did), and matching
-      # community precedent for tag-only repos. Only default-branch commits reliably reset
-      # the clock, so: an unconditional, age-gated keepalive commit. A push made with
-      # GITHUB_TOKEN does not retrigger this workflow.
+      # Keep the existing age-gated branch activity; GITHUB_TOKEN does not retrigger push CI.
       - name: Keepalive — the schedule dies after 60 quiet days, and tag pushes do not count
         env:
           KEEPALIVE_AFTER_DAYS: 40
@@ -277,6 +267,9 @@ jobs:
           V: ${{ steps.up.outputs.version }}
           BUILT: ${{ steps.decide.outputs.build }}
           SYNCED: ${{ steps.decide.outputs.sync }}
+          PREVIOUS_VERSION_DIGEST: ${{ steps.decide.outputs.version_digest }}
+          PREVIOUS_LATEST_DIGEST: ${{ steps.decide.outputs.latest_digest }}
+          PUBLISHED_DIGEST: ${{ steps.artifact.outputs.digest }}
         run: |
           {
             echo "### hf-cli"
@@ -287,4 +280,9 @@ jobs:
             echo "| Built this run | ${BUILT:-n/a} |"
             echo "| Sync work this run | ${SYNCED:-n/a} |"
             echo "| Image | \`${IMAGE}\` |"
+            echo "| Recipe SHA | \`${SOURCE_SHA}\` |"
+            echo "| Base reference | \`$(sed -n 's/^FROM //p' Dockerfile)\` |"
+            echo "| Previous version digest | \`${PREVIOUS_VERSION_DIGEST:-n/a}\` |"
+            echo "| Previous latest digest | \`${PREVIOUS_LATEST_DIGEST:-n/a}\` |"
+            echo "| Published artifact | \`${IMAGE}@${PUBLISHED_DIGEST:-n/a}\` |"
           } >> "${GITHUB_STEP_SUMMARY:-/tmp/summary.md}"
