@@ -127,7 +127,7 @@ jobs:
           set -euo pipefail
           source .github/scripts/maintenance.sh
           build_image "${IMAGE}:${V}" "$V"
-          config_id="$(jq -er '."containerimage.config.digest"' "$BUILD_METADATA")"
+          config_id="$(build_metadata_digest containerimage.config.digest)"
           echo "config_id=$config_id" >> "$GITHUB_OUTPUT"
 
       - name: Prove the image before anything is publishable

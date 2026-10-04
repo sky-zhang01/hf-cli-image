@@ -64,6 +64,10 @@ curl() {
   printf '%s' "$response_code"
 }
 check token-ok 0 fixture.token registry_token
+token_json='{"token":"fixture+/=="}'
+check token-base64-padding 0 fixture+/== registry_token
+token_json='{"token":"fixture=middle"}'
+check token-misplaced-padding 1 '' registry_token
 token_json='{"token":"fixture\nsecond"}'
 check token-newline 1 '' registry_token
 token_json='{"token":true}'
@@ -178,7 +182,11 @@ docker() {
   printf '%s\n' "$*" >> "$DOCKER_CALLS"
   case "$1 $2" in
     'buildx build')
-      printf '{"containerimage.config.digest":"%s","containerimage.digest":"%s"}\n' "$build_config" "$build_manifest" > "$BUILD_METADATA"
+      if [ -n "${metadata_override:-}" ]; then
+        printf '%s' "$metadata_override" > "$BUILD_METADATA"
+      else
+        printf '{"containerimage.config.digest":"%s","containerimage.digest":"%s"}\n' "$build_config" "$build_manifest" > "$BUILD_METADATA"
+      fi
       return "$build_status" ;;
     'image inspect') printf '%s\n' "$loaded_id"; return "$inspect_status" ;;
     *) return "${docker_status:-0}" ;;
@@ -199,7 +207,17 @@ check valid-id-output-but-inspect-failed 1 '' build_quiet
 inspect_status=0
 build_config=invalid
 check invalid-build-config 1 '' build_quiet
+build_config="$other_digest\\n"
+check build-config-trailing-newline 1 '' build_quiet
+build_config="$other_digest\\r"
+check build-config-trailing-CR 1 '' build_quiet
 build_config="$other_digest"
+build_manifest="$manifest_digest\\n"
+check build-manifest-trailing-newline 1 '' build_quiet
+build_manifest="$manifest_digest"
+metadata_override="{\"containerimage.config.digest\":\"$build_config\",\"containerimage.digest\":\"$build_manifest\"} {\"containerimage.config.digest\":\"$build_config\",\"containerimage.digest\":\"$build_manifest\"}"
+check build-multiple-metadata-json 1 '' build_quiet
+metadata_override=''
 check fresh-build-flags 0 '' test -n "$(grep -F -- '--pull --no-cache --platform linux/amd64 --provenance=false --progress=plain --load' "$DOCKER_CALLS")"
 
 # Extract and execute the actual workflow run blocks, instead of a test copy of
@@ -222,7 +240,7 @@ export -f curl git docker sha256sum
 # Pass JSON data to the mocked CLI functions in the child Bash process.
 # shellcheck disable=SC2090
 export response_code response_headers response_body token_json curl_status latest_code latest_headers
-export git_status remote_main hash_status build_status inspect_status loaded_id build_config build_manifest docker_status
+export git_status remote_main hash_status build_status inspect_status loaded_id build_config build_manifest docker_status metadata_override
 export V=2.1.1 FORCE=false EVENT_NAME=schedule EVENT_SCHEDULE='23 */6 * * *'
 export IMAGE=ghcr.io/example/hf-cli GITHUB_OUTPUT="$temporary/github-output"
 export BUILT=false PREVIOUS_DIGEST="$manifest_digest" DIGEST="$manifest_digest" VERIFIED_CONFIG="$other_digest"

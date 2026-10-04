@@ -15,7 +15,7 @@ registry_token() {
     "https://ghcr.io/token?service=ghcr.io&scope=repository:${REGISTRY_REPO:?}:pull" \
     | jq --slurp -er '
       if length != 1 then error("expected one registry token response") else .[0].token end
-      | if type == "string" and test("\\A[A-Za-z0-9._~-]+\\z")
+      | if type == "string" and test("\\A[-A-Za-z0-9._~+/]+=*\\z")
         then . else error("invalid registry token") end
     ')" || return 1
   printf '%s\n' "$token"
@@ -145,6 +145,14 @@ needs_sync() {
   fi
 }
 
+build_metadata_digest() {
+  jq --slurp -er --arg key "$1" '
+    if length != 1 then error("expected one build metadata document") else .[0][$key] end
+    | if type == "string" and test("\\Asha256:[0-9a-f]{64}\\z")
+      then . else error("invalid build metadata digest") end
+  ' "${BUILD_METADATA:?}" || return 1
+}
+
 build_image() {
   local ref="$1" version="$2" base recipe config manifest loaded
   recipe="${SOURCE_SHA:-${GITHUB_SHA:?}}"
@@ -158,9 +166,8 @@ build_image() {
     --metadata-file "${BUILD_METADATA:?}" --build-arg "HF_VERSION=${version}" \
     --build-arg "GIT_SHA=${recipe}" --tag "$ref" . || return 1
   cat "$BUILD_METADATA" || return 1
-  config="$(jq -er '."containerimage.config.digest"' "$BUILD_METADATA")" || return 1
-  manifest="$(jq -er '."containerimage.digest"' "$BUILD_METADATA")" || return 1
-  [[ "$config" =~ ^sha256:[0-9a-f]{64}$ ]] && [[ "$manifest" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+  config="$(build_metadata_digest containerimage.config.digest)" || return 1
+  manifest="$(build_metadata_digest containerimage.digest)" || return 1
   loaded="$(docker image inspect "$ref" --format '{{.Id}}')" || return 1
   # Classic and containerd image stores expose different .Id values.
   if [ "$loaded" != "$config" ] && [ "$loaded" != "$manifest" ]; then
