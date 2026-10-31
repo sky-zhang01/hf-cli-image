@@ -5,7 +5,6 @@ name: Track upstream and publish
 on:
   pull_request:
     branches: [main]
-    paths: [Dockerfile, '.github/**', 'scripts/**']
   push:
     paths: [Dockerfile, '.github/**', 'scripts/**']
   schedule:
@@ -46,8 +45,6 @@ jobs:
       - name: Verify maintenance boundary checks
         run: bash .github/scripts/test-maintenance.sh
       - name: Build and verify the recipe without publishing
-        env:
-          BUILD_METADATA: ${{ runner.temp }}/hf-verify-build.json
         run: |
           set -euo pipefail
           source .github/scripts/maintenance.sh
@@ -63,6 +60,7 @@ jobs:
       (needs.verify.result == 'success' || needs.verify.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
+      actions: write
       contents: write
       packages: write
     steps:
@@ -118,17 +116,13 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Build locally
-        id: build
         if: steps.decide.outputs.build == 'true'
         env:
           V: ${{ steps.up.outputs.version }}
-          BUILD_METADATA: ${{ runner.temp }}/hf-publish-build.json
         run: |
           set -euo pipefail
           source .github/scripts/maintenance.sh
           build_image "${IMAGE}:${V}" "$V"
-          config_id="$(build_metadata_digest containerimage.config.digest)"
-          echo "config_id=$config_id" >> "$GITHUB_OUTPUT"
 
       - name: Prove the image before anything is publishable
         if: steps.decide.outputs.build == 'true'
@@ -184,15 +178,11 @@ jobs:
         env:
           V: ${{ steps.up.outputs.version }}
           DIGEST: ${{ steps.artifact.outputs.digest }}
-          VERIFIED_CONFIG: ${{ steps.build.outputs.config_id }}
         run: |
           set -euo pipefail
           source .github/scripts/maintenance.sh
           tok="$(registry_token)"
-          published_config="$(registry_config "$DIGEST" "$tok")"
-          if [ -n "$VERIFIED_CONFIG" ] && [ "$published_config" != "$VERIFIED_CONFIG" ]; then
-            echo '::error::published config differs from the verified build metadata'; exit 1
-          fi
+          assert_published_schema2 "$DIGEST" "$tok"
           docker pull "${IMAGE}@${DIGEST}"
           docker tag "${IMAGE}@${DIGEST}" "${IMAGE}:latest"
           assert_current_main
@@ -242,24 +232,12 @@ jobs:
               --notes "Packages upstream [huggingface_hub ${V}](https://github.com/huggingface/huggingface_hub/releases/tag/v${V}) as \`${IMAGE}:${V}\`. \`latest\` now points at this version."
           fi
 
-      # Keep the existing age-gated branch activity; GITHUB_TOKEN does not retrigger push CI.
-      - name: Keepalive — the schedule dies after 60 quiet days, and tag pushes do not count
+      # A public repo's schedule is disabled after 60 days without repository activity, and
+      # tag pushes do not count. Re-enabling the workflow through the API keeps it alive.
+      - name: Keepalive
         env:
-          KEEPALIVE_AFTER_DAYS: 40
-        run: |
-          set -euo pipefail
-          last="$(git log -1 --format=%ct)"
-          age_days="$(( ( $(date +%s) - last ) / 86400 ))"
-          echo "default-branch HEAD is ${age_days} days old"
-          if [ "${age_days}" -lt "${KEEPALIVE_AFTER_DAYS}" ]; then
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          date -u '+%Y-%m-%dT%H:%M:%SZ' > .github/keepalive
-          git add .github/keepalive
-          git commit -m "chore: keepalive — a public repo's schedule is disabled after 60 quiet days"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/publish.yml/enable"
 
       - name: Summary
         if: always()

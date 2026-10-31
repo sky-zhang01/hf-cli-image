@@ -55,8 +55,9 @@ registry_probe() {
   printf '200 %s\n' "$digest"
 }
 
-registry_config() {
-  local digest="$1" token="$2" body code actual config
+# TrueNAS only detects updates of a Docker schema2 single manifest.
+assert_published_schema2() {
+  local digest="$1" token="$2" body code actual
   [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
   body="$(mktemp)" || return 1
   if ! code="$(curl -sS --retry 3 --connect-timeout 10 -o "$body" -w '%{http_code}' \
@@ -76,16 +77,14 @@ registry_config() {
     echo '::error::published manifest status or content digest differs' >&2
     return 1
   fi
-  if ! config="$(jq --slurp -er '
-      if length != 1 then error("expected one manifest") else .[0].config.digest end
-      | if type == "string" and test("\\Asha256:[0-9a-f]{64}\\z")
-        then . else error("invalid manifest config digest") end
-    ' "$body")"; then
+  if ! jq --slurp -e '
+      length == 1 and .[0].mediaType == "application/vnd.docker.distribution.manifest.v2+json"
+    ' "$body" >/dev/null; then
     rm -f -- "$body"
+    echo '::error::published manifest is not Docker schema2' >&2
     return 1
   fi
   rm -f -- "$body"
-  printf '%s\n' "$config"
 }
 
 git_tag_exists() {
@@ -145,16 +144,8 @@ needs_sync() {
   fi
 }
 
-build_metadata_digest() {
-  jq --slurp -er --arg key "$1" '
-    if length != 1 then error("expected one build metadata document") else .[0][$key] end
-    | if type == "string" and test("\\Asha256:[0-9a-f]{64}\\z")
-      then . else error("invalid build metadata digest") end
-  ' "${BUILD_METADATA:?}" || return 1
-}
-
 build_image() {
-  local ref="$1" version="$2" base recipe config manifest loaded
+  local ref="$1" version="$2" base recipe descriptor
   recipe="${SOURCE_SHA:-${GITHUB_SHA:?}}"
   base="$(sed -n 's/^FROM[[:space:]]\{1,\}\([^[:space:]]*\)[[:space:]]*$/\1/p' Dockerfile)" || return 1
   if [[ ! "$base" =~ ^python:[0-9]+\.[0-9]+\.[0-9]+-slim@sha256:[0-9a-f]{64}$ ]]; then
@@ -163,16 +154,14 @@ build_image() {
   fi
   echo "Recipe base: ${base}; recipe SHA: ${recipe}"
   docker buildx build --pull --no-cache --platform linux/amd64 --provenance=false --progress=plain --load \
-    --metadata-file "${BUILD_METADATA:?}" --build-arg "HF_VERSION=${version}" \
-    --build-arg "GIT_SHA=${recipe}" --tag "$ref" . || return 1
-  cat "$BUILD_METADATA" || return 1
-  config="$(build_metadata_digest containerimage.config.digest)" || return 1
-  manifest="$(build_metadata_digest containerimage.digest)" || return 1
-  loaded="$(docker image inspect "$ref" --format '{{.Id}}')" || return 1
-  # Classic and containerd image stores expose different .Id values.
-  if [ "$loaded" != "$config" ] && [ "$loaded" != "$manifest" ]; then
-    echo '::error::loaded image does not match build metadata' >&2
+    --build-arg "HF_VERSION=${version}" --build-arg "GIT_SHA=${recipe}" --tag "$ref" . || return 1
+  # Only the containerd image store (the default from ubuntu-26.04 on) reports a Descriptor:
+  # the stored manifest that docker push sends. TrueNAS needs it to be Docker schema2.
+  descriptor="$(docker image inspect "$ref" --format '{{json .Descriptor}}')" || return 1
+  if ! jq -e '.mediaType == "application/vnd.docker.distribution.manifest.v2+json"' \
+      <<< "$descriptor" >/dev/null; then
+    echo "::error::built image ${descriptor} is not a Docker schema2 manifest; this needs the containerd image store" >&2
     return 1
   fi
-  echo "Built config ${config}; build manifest ${manifest}; loaded image ${loaded}"
+  echo "Built ${descriptor}"
 }

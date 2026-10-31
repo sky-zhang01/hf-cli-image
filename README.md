@@ -38,7 +38,7 @@ Use the image digest for an exact rollback, including rebuilds from the same rec
 docker pull ghcr.io/sky-zhang01/hf-cli@sha256:<recorded-digest>
 ```
 
-CI logs record the installed package list and build metadata. The run summary records the
+CI logs record the installed package list and the built image descriptor. The run summary records the
 pinned base reference, recipe SHA, previous tag digests and published digest.
 Git version tags remain create-only audit refs;
 the image's revision label identifies the recipe, while its digest identifies the built artifact.
@@ -57,11 +57,12 @@ scheduled run (every 6h)
   → resolve version from PyPI
   → probe registry by HTTP status: version tag + latest digest
   → published AND latest/git-tag/Release all in sync?  →  exit
-  → build locally, prove it, publish the version tag   (if absent or refresh requested)
-  → gate: the tag must be anonymously pullable
+  → build locally as a Docker schema2 manifest, prove it, publish the version tag
+                                                       (if absent or refresh requested)
+  → gate: the tag must be anonymously pullable, and a Docker schema2 manifest
   → pull the exact published digest, move `latest`, assert both tags equal that digest
   → ensure git tag + GitHub Release
-  → keepalive commit if the default branch has been quiet ~40 days
+  → re-enable the workflow through the API (keepalive)
 ```
 
 The same workflow refreshes the current version every Sunday and when recipe changes reach
@@ -95,8 +96,8 @@ digest, so "the version tag exists" is not the invariant that matters. The workf
 repository, scheduled workflows are auto-disabled after 60 days without repository activity.
 Verified against this repo's own `/activity` API: a real tag push leaves no activity record,
 while branch pushes do — so a tag-only repo dies on schedule regardless of upstream cadence.
-The workflow therefore makes an unconditional, age-gated keepalive commit (at most one per ~40
-days). The `--load`-then-push build path keeps the image in the local store for verification.
+Every publishing run therefore re-enables the workflow through the Actions API instead of
+committing. The `--load`-then-push build path keeps the image in the local store for verification.
 Release behavior does not depend on a particular host's model serving or update mechanism.
 
 The pipeline follows the stable version PyPI currently reports. If PyPI reports an older

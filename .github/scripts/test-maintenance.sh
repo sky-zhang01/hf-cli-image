@@ -102,27 +102,29 @@ curl_status=0
 
 # JSON fixture data, never command text.
 # shellcheck disable=SC2089
-response_body="{\"schemaVersion\":2,\"config\":{\"digest\":\"$other_digest\"}}"
+schema2_body="{\"schemaVersion\":2,\"mediaType\":\"application/vnd.docker.distribution.manifest.v2+json\",\"config\":{\"digest\":\"$other_digest\"}}"
+response_body="$schema2_body"
 manifest_digest="sha256:$(printf '%s' "$response_body" | sha256sum | awk '{print $1}')"
-check manifest-config 0 "$other_digest" registry_config "$manifest_digest" fixture
-check manifest-body-digest-mismatch 1 '' registry_config "$digest" fixture
+check published-schema2 0 '' assert_published_schema2 "$manifest_digest" fixture
+check manifest-body-digest-mismatch 1 '' assert_published_schema2 "$digest" fixture
 hash_status=0
 sha256sum() { command sha256sum "$@"; return "$hash_status"; }
 hash_status=1
-check valid-hash-output-but-hash-failed 1 '' registry_config "$manifest_digest" fixture
+check valid-hash-output-but-hash-failed 1 '' assert_published_schema2 "$manifest_digest" fixture
 hash_status=0
 response_code=404
-check manifest-body404 1 '' registry_config "$manifest_digest" fixture
+check manifest-body404 1 '' assert_published_schema2 "$manifest_digest" fixture
 response_code=200
 curl_status=7
-check manifest-body-network-failed 1 '' registry_config "$manifest_digest" fixture
+check manifest-body-network-failed 1 '' assert_published_schema2 "$manifest_digest" fixture
 curl_status=0
-response_body='{"schemaVersion":2,"config":{"digest":true}}'
-invalid_config_digest="sha256:$(printf '%s' "$response_body" | sha256sum | awk '{print $1}')"
-check manifest-config-type 1 '' registry_config "$invalid_config_digest" fixture
-# JSON fixture data, never command text.
-# shellcheck disable=SC2089
+response_body="{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"config\":{\"digest\":\"$other_digest\"}}"
+oci_digest="sha256:$(printf '%s' "$response_body" | sha256sum | awk '{print $1}')"
+check reject-oci-manifest 1 '' assert_published_schema2 "$oci_digest" fixture
 response_body="{\"schemaVersion\":2,\"config\":{\"digest\":\"$other_digest\"}}"
+untyped_digest="sha256:$(printf '%s' "$response_body" | sha256sum | awk '{print $1}')"
+check reject-missing-media-type 1 '' assert_published_schema2 "$untyped_digest" fixture
+response_body="$schema2_body"
 
 git_status=0
 remote_main=''
@@ -169,55 +171,39 @@ check missing-git-tag 0 true needs_sync false 200 "$digest" "$digest" true false
 check missing-release 0 true needs_sync false 200 "$digest" "$digest" false true
 check built-image 0 true needs_sync true 200 "$digest" "$digest" false false
 
-# Run the production build helper with both image-store conventions and failures
+# Run the production build helper against the containerd image store and failures
 # that still produce plausible output; no fixture contacts a real registry.
-export BUILD_METADATA="$temporary/build.json"
 build_status=0
 inspect_status=0
-loaded_id="$other_digest"
-build_manifest="$manifest_digest"
-build_config="$other_digest"
+# JSON fixture data, never command text.
+# shellcheck disable=SC2089
+loaded_descriptor="{\"mediaType\":\"application/vnd.docker.distribution.manifest.v2+json\",\"digest\":\"$manifest_digest\",\"size\":1}"
 export DOCKER_CALLS="$temporary/docker-calls"
 docker() {
   printf '%s\n' "$*" >> "$DOCKER_CALLS"
   case "$1 $2" in
-    'buildx build')
-      if [ -n "${metadata_override:-}" ]; then
-        printf '%s' "$metadata_override" > "$BUILD_METADATA"
-      else
-        printf '{"containerimage.config.digest":"%s","containerimage.digest":"%s"}\n' "$build_config" "$build_manifest" > "$BUILD_METADATA"
-      fi
-      return "$build_status" ;;
-    'image inspect') printf '%s\n' "$loaded_id"; return "$inspect_status" ;;
+    'buildx build') return "$build_status" ;;
+    'image inspect') printf '%s\n' "$loaded_descriptor"; return "$inspect_status" ;;
     *) return "${docker_status:-0}" ;;
   esac
 }
 build_quiet() { build_image hf-fixture:2.1.1 2.1.1 >/dev/null; }
-check classic-image-store 0 '' build_quiet
-loaded_id="$manifest_digest"
-check containerd-image-store 0 '' build_quiet
-loaded_id="$digest"
-check loaded-image-mismatch 1 '' build_quiet
-loaded_id="$other_digest"
+check schema2-build 0 '' build_quiet
+schema2_descriptor="$loaded_descriptor"
+loaded_descriptor="{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"$manifest_digest\",\"size\":1}"
+check oci-manifest-build 1 '' build_quiet
+loaded_descriptor="{\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"digest\":\"$manifest_digest\",\"size\":1}"
+check oci-index-build 1 '' build_quiet
+# The classic image store has no descriptor.
+loaded_descriptor=null
+check classic-image-store 1 '' build_quiet
+loaded_descriptor="$schema2_descriptor"
 build_status=1
-check metadata-written-but-build-failed 1 '' build_quiet
+check build-failed 1 '' build_quiet
 build_status=0
 inspect_status=1
-check valid-id-output-but-inspect-failed 1 '' build_quiet
+check valid-descriptor-output-but-inspect-failed 1 '' build_quiet
 inspect_status=0
-build_config=invalid
-check invalid-build-config 1 '' build_quiet
-build_config="$other_digest\\n"
-check build-config-trailing-newline 1 '' build_quiet
-build_config="$other_digest\\r"
-check build-config-trailing-CR 1 '' build_quiet
-build_config="$other_digest"
-build_manifest="$manifest_digest\\n"
-check build-manifest-trailing-newline 1 '' build_quiet
-build_manifest="$manifest_digest"
-metadata_override="{\"containerimage.config.digest\":\"$build_config\",\"containerimage.digest\":\"$build_manifest\"} {\"containerimage.config.digest\":\"$build_config\",\"containerimage.digest\":\"$build_manifest\"}"
-check build-multiple-metadata-json 1 '' build_quiet
-metadata_override=''
 check fresh-build-flags 0 '' test -n "$(grep -F -- '--pull --no-cache --platform linux/amd64 --provenance=false --progress=plain --load' "$DOCKER_CALLS")"
 
 # Extract and execute the actual workflow run blocks, instead of a test copy of
@@ -240,10 +226,11 @@ export -f curl git docker sha256sum
 # Pass JSON data to the mocked CLI functions in the child Bash process.
 # shellcheck disable=SC2090
 export response_code response_headers response_body token_json curl_status latest_code latest_headers
-export git_status remote_main hash_status build_status inspect_status loaded_id build_config build_manifest docker_status metadata_override
+# shellcheck disable=SC2090
+export git_status remote_main hash_status build_status inspect_status loaded_descriptor docker_status
 export V=2.1.1 FORCE=false EVENT_NAME=schedule EVENT_SCHEDULE='23 */6 * * *'
 export IMAGE=ghcr.io/example/hf-cli GITHUB_OUTPUT="$temporary/github-output"
-export BUILT=false PREVIOUS_DIGEST="$manifest_digest" DIGEST="$manifest_digest" VERIFIED_CONFIG="$other_digest"
+export BUILT=false PREVIOUS_DIGEST="$manifest_digest" DIGEST="$manifest_digest"
 response_code=200
 response_headers="HTTP/2 200\r\ndocker-content-digest: $manifest_digest\r\n\r\n"
 remote_main="$SOURCE_SHA"$'\trefs/heads/main'
@@ -281,10 +268,14 @@ check workflow-published-version404 1 '' workflow_step 'Gate — the published t
 response_code=200
 check workflow-move-latest 0 '' workflow_step 'Move latest'
 check workflow-latest-pushed 0 '' grep -q '^push ghcr.io/example/hf-cli:latest$' "$DOCKER_CALLS"
-VERIFIED_CONFIG="$digest"
-check workflow-config-mismatch 1 '' workflow_step 'Move latest'
-check workflow-config-mismatch-no-push 1 '' grep -q '^push ' "$DOCKER_CALLS"
-VERIFIED_CONFIG="$other_digest"
+response_body="{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\"}"
+DIGEST="sha256:$(printf '%s' "$response_body" | sha256sum | awk '{print $1}')"
+response_headers="HTTP/2 200\r\ndocker-content-digest: $DIGEST\r\n\r\n"
+check workflow-published-not-schema2 1 '' workflow_step 'Move latest'
+check workflow-published-not-schema2-no-push 1 '' grep -q '^push ' "$DOCKER_CALLS"
+response_body="$schema2_body"
+DIGEST="$manifest_digest"
+response_headers="HTTP/2 200\r\ndocker-content-digest: $manifest_digest\r\n\r\n"
 remote_main='2222222222222222222222222222222222222222'$'\trefs/heads/main'
 check workflow-stale-main 1 '' workflow_step 'Move latest'
 check workflow-stale-main-no-push 1 '' grep -q '^push ' "$DOCKER_CALLS"
