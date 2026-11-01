@@ -3,8 +3,9 @@
 # Upstream is the PyPI package `huggingface_hub` (github.com/huggingface/huggingface_hub).
 # Hugging Face does not publish a container image for the CLI, so this repository only
 # tracks upstream releases and packages them. It adds no functionality of its own.
-# Dependabot tracks both the supported stable Python release and its base digest.
-FROM python:3.14.8-slim@sha256:c3e521df8b2b498a7a682e7e18676771cb80c6b75b8699af886b2d554ce40151
+# The base follows the newest patch release of the Python minor version that HF supports.
+# Every build pulls it, so the weekly refresh picks up base security fixes on its own.
+FROM python:3.15-slim
 
 # Deliberately no default. The version is NOT stored in this repository: CI resolves the
 # latest release from the PyPI JSON API and passes it in. That is why there is nothing here

@@ -38,8 +38,7 @@ Use the image digest for an exact rollback, including rebuilds from the same rec
 docker pull ghcr.io/sky-zhang01/hf-cli@sha256:<recorded-digest>
 ```
 
-CI logs record the installed package list and the built image descriptor. The run summary records the
-pinned base reference, recipe SHA, previous tag digests and published digest.
+CI logs record the installed package list and the built image descriptor.
 Git version tags remain create-only audit refs;
 the image's revision label identifies the recipe, while its digest identifies the built artifact.
 
@@ -48,9 +47,9 @@ the image's revision label identifies the recipe, while its digest identifies th
 The HF version is not stored in this repository. `ARG HF_VERSION` has no default, and
 `${HF_VERSION:?}` makes a missing build-arg a hard build failure. CI resolves the current final
 or post release from the PyPI JSON API and validates the complete string before using it.
-Dependabot independently opens weekly PRs for the literal Python base tag/digest and the
-SHA-pinned workflow actions; it does not duplicate HF discovery. Runtime upgrades use the
-newest supported stable release compatible with HF, without prereleases.
+The base image is `python:3.15-slim`: every build pulls the newest 3.15 patch release, so the
+weekly refresh applies base fixes without a pull request. Moving to a new Python minor version
+is a one-line recipe change once HF supports it. No dependency bot runs on this repository.
 
 ```text
 scheduled run (every 6h)
@@ -66,14 +65,11 @@ scheduled run (every 6h)
 ```
 
 The same workflow refreshes the current version every Sunday and when recipe changes reach
-`main`. PRs and recipe pushes run a separate job with read-only permissions: it builds the
-image, verifies exact Python/HF metadata and `pip check`, downloads a pinned public README
-over HTTPS, and downloads a 454 KB Xet fixture through the real native `hf-xet` CAS transport.
-The Xet check rejects HTTP fallback, checks size/SHA256, then verifies online cache reuse and
-offline reuse. PR jobs never publish or receive publishing credentials. The publishing job
-performs the same verification on its own build before pushing.
-Immediately before publishing either tag, CI checks that remote `main` still equals the
-recipe SHA, so a queued run cannot publish an outdated recipe over a newer commit.
+`main`. Pull requests run a separate job with read-only permissions: it builds the image,
+verifies the exact HF version and `pip check`, downloads a pinned public README over HTTPS,
+and downloads one pinned 454 KB Xet-backed file, checked by size and SHA256. PR jobs never
+publish or receive publishing credentials. The publishing job runs the same verification on
+its own build before pushing.
 
 The registry is the state store, and every step after the probe is a reconcile: a run that
 dies halfway is healed by the next run, not by the next upstream release. Registry probes
@@ -104,9 +100,6 @@ The pipeline follows the stable version PyPI currently reports. If PyPI reports 
 already-published version, reconciliation moves `latest` back to that version's digest. This
 also applies if upstream withdraws a release; CI does not silently keep a newer version in
 preference to the current upstream report.
-
-GitHub and Gitea are independently maintained. Their changes are synchronized only when the
-owner explicitly requests synchronization.
 
 ## Using it
 

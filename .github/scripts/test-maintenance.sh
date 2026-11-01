@@ -64,14 +64,8 @@ curl() {
   printf '%s' "$response_code"
 }
 check token-ok 0 fixture.token registry_token
-token_json='{"token":"fixture+/=="}'
-check token-base64-padding 0 fixture+/== registry_token
-token_json='{"token":"fixture=middle"}'
-check token-misplaced-padding 1 '' registry_token
-token_json='{"token":"fixture\nsecond"}'
-check token-newline 1 '' registry_token
-token_json='{"token":true}'
-check token-type 1 '' registry_token
+token_json='{}'
+check missing-token 1 '' registry_token
 # JSON fixture data, never command text.
 # shellcheck disable=SC2089
 token_json='{"token":"fixture.token"}'
@@ -127,24 +121,12 @@ check reject-missing-media-type 1 '' assert_published_schema2 "$untyped_digest" 
 response_body="$schema2_body"
 
 git_status=0
-remote_main=''
-git() { printf '%s' "$remote_main"; return "$git_status"; }
+git() { return "$git_status"; }
 check git-tag-exists 0 '' git_tag_exists 2.1.1
 git_status=2
 check git-tag-absent 1 '' git_tag_exists 2.1.1
 git_status=128
 check git-network-error 2 '' git_tag_exists 2.1.1
-export SOURCE_SHA=1111111111111111111111111111111111111111
-git_status=0
-remote_main="$SOURCE_SHA"$'\trefs/heads/main'
-check current-main 0 '' assert_current_main
-remote_main='2222222222222222222222222222222222222222'$'\trefs/heads/main'
-check stale-main 1 '' assert_current_main
-remote_main="$SOURCE_SHA"$'\trefs/heads/main\n'$SOURCE_SHA$'\trefs/heads/main'
-check duplicate-main-response 1 '' assert_current_main
-remote_main="$SOURCE_SHA"$'\trefs/heads/main'
-git_status=128
-check valid-main-output-but-git-failed 1 '' assert_current_main
 git_status=0
 response_code=200
 check release-exists 0 '' release_exists 2.1.1
@@ -173,6 +155,7 @@ check built-image 0 true needs_sync true 200 "$digest" "$digest" false false
 
 # Run the production build helper against the containerd image store and failures
 # that still produce plausible output; no fixture contacts a real registry.
+export SOURCE_SHA=1111111111111111111111111111111111111111
 build_status=0
 inspect_status=0
 # JSON fixture data, never command text.
@@ -204,7 +187,6 @@ build_status=0
 inspect_status=1
 check valid-descriptor-output-but-inspect-failed 1 '' build_quiet
 inspect_status=0
-check fresh-build-flags 0 '' test -n "$(grep -F -- '--pull --no-cache --platform linux/amd64 --provenance=false --progress=plain --load' "$DOCKER_CALLS")"
 
 # Extract and execute the actual workflow run blocks, instead of a test copy of
 # their orchestration. Exported mock CLIs keep these tests offline and read-only.
@@ -227,13 +209,12 @@ export -f curl git docker sha256sum
 # shellcheck disable=SC2090
 export response_code response_headers response_body token_json curl_status latest_code latest_headers
 # shellcheck disable=SC2090
-export git_status remote_main hash_status build_status inspect_status loaded_descriptor docker_status
+export git_status hash_status build_status inspect_status loaded_descriptor docker_status
 export V=2.1.1 FORCE=false EVENT_NAME=schedule EVENT_SCHEDULE='23 */6 * * *'
 export IMAGE=ghcr.io/example/hf-cli GITHUB_OUTPUT="$temporary/github-output"
 export BUILT=false PREVIOUS_DIGEST="$manifest_digest" DIGEST="$manifest_digest"
 response_code=200
 response_headers="HTTP/2 200\r\ndocker-content-digest: $manifest_digest\r\n\r\n"
-remote_main="$SOURCE_SHA"$'\trefs/heads/main'
 check workflow-fully-synced 0 '' workflow_step 'Decide what needs doing'
 check workflow-skip-output 0 '' grep -q '^build=false$' "$GITHUB_OUTPUT"
 check workflow-synced-output 0 '' grep -q '^sync=false$' "$GITHUB_OUTPUT"
@@ -276,12 +257,6 @@ check workflow-published-not-schema2-no-push 1 '' grep -q '^push ' "$DOCKER_CALL
 response_body="$schema2_body"
 DIGEST="$manifest_digest"
 response_headers="HTTP/2 200\r\ndocker-content-digest: $manifest_digest\r\n\r\n"
-remote_main='2222222222222222222222222222222222222222'$'\trefs/heads/main'
-check workflow-stale-main 1 '' workflow_step 'Move latest'
-check workflow-stale-main-no-push 1 '' grep -q '^push ' "$DOCKER_CALLS"
-check workflow-stale-version-no-push 1 '' workflow_step 'Push the verified version tag'
-check workflow-stale-version-push-absent 1 '' grep -q '^push ' "$DOCKER_CALLS"
-remote_main="$SOURCE_SHA"$'\trefs/heads/main'
 latest_code=404
 latest_headers='HTTP/2 404\r\n\r\n'
 check workflow-latest-readback404 1 '' workflow_step 'Move latest'

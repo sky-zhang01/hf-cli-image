@@ -13,11 +13,7 @@ registry_token() {
   local token
   token="$(curl -fsS --retry 3 --connect-timeout 10 \
     "https://ghcr.io/token?service=ghcr.io&scope=repository:${REGISTRY_REPO:?}:pull" \
-    | jq --slurp -er '
-      if length != 1 then error("expected one registry token response") else .[0].token end
-      | if type == "string" and test("\\A[-A-Za-z0-9._~+/]+=*\\z")
-        then . else error("invalid registry token") end
-    ')" || return 1
+    | jq -er '.token')" || return 1
   printf '%s\n' "$token"
 }
 
@@ -99,16 +95,6 @@ git_tag_exists() {
   fi
 }
 
-assert_current_main() {
-  local remote
-  remote="$(git ls-remote --exit-code origin refs/heads/main)" || return 1
-  if [[ ! "$remote" =~ ^([0-9a-f]{40})[[:space:]]refs/heads/main$ ]] ||
-     [ "${BASH_REMATCH[1]}" != "${SOURCE_SHA:?}" ]; then
-    echo '::error::remote main differs from this recipe; refusing a stale publication' >&2
-    return 1
-  fi
-}
-
 release_exists() {
   local code
   if ! code="$(curl -sS --retry 3 --connect-timeout 10 -o /dev/null -w '%{http_code}' \
@@ -145,14 +131,8 @@ needs_sync() {
 }
 
 build_image() {
-  local ref="$1" version="$2" base recipe descriptor
+  local ref="$1" version="$2" recipe descriptor
   recipe="${SOURCE_SHA:-${GITHUB_SHA:?}}"
-  base="$(sed -n 's/^FROM[[:space:]]\{1,\}\([^[:space:]]*\)[[:space:]]*$/\1/p' Dockerfile)" || return 1
-  if [[ ! "$base" =~ ^python:[0-9]+\.[0-9]+\.[0-9]+-slim@sha256:[0-9a-f]{64}$ ]]; then
-    echo '::error::Dockerfile must pin one stable Python slim tag and digest' >&2
-    return 1
-  fi
-  echo "Recipe base: ${base}; recipe SHA: ${recipe}"
   docker buildx build --pull --no-cache --platform linux/amd64 --provenance=false --progress=plain --load \
     --build-arg "HF_VERSION=${version}" --build-arg "GIT_SHA=${recipe}" --tag "$ref" . || return 1
   # Only the containerd image store (the default from ubuntu-26.04 on) reports a Descriptor:

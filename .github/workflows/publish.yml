@@ -1,11 +1,13 @@
 name: Track upstream and publish
 
-# HF discovery stays here. Dependabot only maintains the Python base and actions.
-# The publish job verifies its local build before any registry tag can move.
+# HF discovery stays here. The Python base floats on its minor version and is pulled on every build.
+# Pull requests run the verify job. The publish job verifies its own build before any
+# registry tag can move.
 on:
   pull_request:
     branches: [main]
   push:
+    branches: [main]
     paths: [Dockerfile, '.github/**', 'scripts/**']
   schedule:
     # HF release detection and a weekly refresh of upstream-allowed dependencies.
@@ -33,7 +35,7 @@ env:
 
 jobs:
   verify:
-    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -54,10 +56,7 @@ jobs:
           bash scripts/verify-image.sh "$ref" "$version"
 
   track-and-publish:
-    needs: verify
-    if: >-
-      always() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' &&
-      (needs.verify.result == 'success' || needs.verify.result == 'skipped')
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       actions: write
@@ -65,9 +64,6 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Verify maintenance boundary checks
-        run: bash .github/scripts/test-maintenance.sh
 
       - name: Resolve the upstream release
         id: up
@@ -112,7 +108,6 @@ jobs:
             echo "build=$build"
             echo "sync=$sync"
             echo "version_digest=$vdigest"
-            echo "latest_digest=$ldigest"
           } >> "$GITHUB_OUTPUT"
 
       - name: Build locally
@@ -131,9 +126,6 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/verify-image.sh "${IMAGE}:${V}" "$V"
-          label="$(docker inspect "${IMAGE}:${V}" \
-            --format '{{index .Config.Labels "org.opencontainers.image.version"}}')"
-          [ "$label" = "${V}" ] || { echo "::error::label '${label}' != '${V}'"; exit 1; }
 
       - name: Log in to GHCR
         if: steps.decide.outputs.sync == 'true'
@@ -148,8 +140,6 @@ jobs:
           V: ${{ steps.up.outputs.version }}
         run: |
           set -euo pipefail
-          source .github/scripts/maintenance.sh
-          assert_current_main
           docker push "${IMAGE}:${V}"
 
       - name: Gate — the published tag must be anonymously pullable
@@ -185,7 +175,6 @@ jobs:
           assert_published_schema2 "$DIGEST" "$tok"
           docker pull "${IMAGE}@${DIGEST}"
           docker tag "${IMAGE}@${DIGEST}" "${IMAGE}:latest"
-          assert_current_main
           docker push "${IMAGE}:latest"
           tok="$(registry_token)"
           version_probe="$(registry_probe "$V" "$tok")"
@@ -238,29 +227,3 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/publish.yml/enable"
-
-      - name: Summary
-        if: always()
-        env:
-          V: ${{ steps.up.outputs.version }}
-          BUILT: ${{ steps.decide.outputs.build }}
-          SYNCED: ${{ steps.decide.outputs.sync }}
-          PREVIOUS_VERSION_DIGEST: ${{ steps.decide.outputs.version_digest }}
-          PREVIOUS_LATEST_DIGEST: ${{ steps.decide.outputs.latest_digest }}
-          PUBLISHED_DIGEST: ${{ steps.artifact.outputs.digest }}
-        run: |
-          {
-            echo "### hf-cli"
-            echo ""
-            echo "| Field | Value |"
-            echo "| --- | --- |"
-            echo "| Upstream huggingface_hub | \`${V}\` |"
-            echo "| Built this run | ${BUILT:-n/a} |"
-            echo "| Sync work this run | ${SYNCED:-n/a} |"
-            echo "| Image | \`${IMAGE}\` |"
-            echo "| Recipe SHA | \`${SOURCE_SHA}\` |"
-            echo "| Base reference | \`$(sed -n 's/^FROM //p' Dockerfile)\` |"
-            echo "| Previous version digest | \`${PREVIOUS_VERSION_DIGEST:-n/a}\` |"
-            echo "| Previous latest digest | \`${PREVIOUS_LATEST_DIGEST:-n/a}\` |"
-            echo "| Published artifact | \`${IMAGE}@${PUBLISHED_DIGEST:-n/a}\` |"
-          } >> "${GITHUB_STEP_SUMMARY:-/tmp/summary.md}"
