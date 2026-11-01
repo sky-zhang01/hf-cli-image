@@ -1,6 +1,6 @@
 name: Track upstream and publish
 
-# HF discovery stays here. Dependabot only maintains the Python base and actions.
+# HF discovery stays here. The Python base floats on its minor version and is pulled on every build.
 # Pull requests run the verify job. The publish job verifies its own build before any
 # registry tag can move.
 on:

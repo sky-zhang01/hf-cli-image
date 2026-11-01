@@ -47,9 +47,9 @@ the image's revision label identifies the recipe, while its digest identifies th
 The HF version is not stored in this repository. `ARG HF_VERSION` has no default, and
 `${HF_VERSION:?}` makes a missing build-arg a hard build failure. CI resolves the current final
 or post release from the PyPI JSON API and validates the complete string before using it.
-Dependabot independently opens weekly PRs for the literal Python base tag/digest and the
-SHA-pinned workflow actions; it does not duplicate HF discovery. Runtime upgrades use the
-newest supported stable release compatible with HF, without prereleases.
+The base image is `python:3.15-slim`: every build pulls the newest 3.15 patch release, so the
+weekly refresh applies base fixes without a pull request. Moving to a new Python minor version
+is a one-line recipe change once HF supports it. No dependency bot runs on this repository.
 
 ```text
 scheduled run (every 6h)
